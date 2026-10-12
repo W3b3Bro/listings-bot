@@ -11,6 +11,7 @@ Modes:
 Env: BOT_TOKEN, CHANNEL (@name), ADMIN_CHAT_ID (optional: heartbeat + failure DMs),
      DISABLE_SOURCES (optional, comma list of source names to skip),
      DB_PATH (optional, e.g. /data/state.db on a persistent volume)
+     SKIP_POSTS (optional, comma list of scheduled posts to skip: digest,recap,heartbeat)
 """
 import argparse
 import csv
@@ -476,9 +477,13 @@ def recap_text(c):
     return "\n".join(lines)
 
 
+def runner():
+    return "github" if os.environ.get("GITHUB_ACTIONS") else os.environ.get("RUNNER_NAME", "local")
+
+
 def heartbeat_text(c):
     n = c.execute("SELECT COUNT(*) FROM posts WHERE ts>=?", (time.time() - 86400,)).fetchone()[0]
-    return f"Bot alive. Alerts in 24h: {n}. Failing sources: {kv_get(c, 'last_failed') or 'none'}"
+    return f"Bot alive ({runner()}). Alerts in 24h: {n}. Failing sources: {kv_get(c, 'last_failed') or 'none'}"
 
 
 # ---------- modes ----------
@@ -581,11 +586,12 @@ def run(dry):
     followups(c, mk, channel, dry, failed)
 
     now = datetime.now(TZ)
+    skip = {x.strip() for x in os.environ.get("SKIP_POSTS", "").split(",") if x.strip()}
     for key, hour, build, target in (
             ("digest", DIGEST_HOUR, digest_text, channel),
             ("recap", RECAP_HOUR, lambda: recap_text(c), channel),
             ("heartbeat", HEARTBEAT_HOUR, lambda: heartbeat_text(c), admin)):
-        if now.hour < hour or kv_get(c, key) == str(now.date()) or (not target and not dry):
+        if key in skip or now.hour < hour or kv_get(c, key) == str(now.date()) or (not target and not dry):
             continue
         text = build()
         if text:
@@ -607,7 +613,7 @@ def run(dry):
         last = float(kv_get(c, "last_alert") or 0)
         if admin and not dry and time.time() - last > 3600:
             try:
-                send(admin, "Bot sources failing: " + "; ".join(failed))
+                send(admin, f"Bot sources failing ({runner()}): " + "; ".join(failed))
                 kv_set(c, "last_alert", time.time())
             except Exception:
                 pass
