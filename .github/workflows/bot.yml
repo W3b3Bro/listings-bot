@@ -1,0 +1,54 @@
+name: listings-bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check = test sources (no posting), run = normal run"
+        type: choice
+        default: check
+        options: [check, run]
+
+concurrency:
+  group: listings-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bot:
+    if: github.event_name == 'workflow_dispatch' || vars.LIVE == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MODE: ${{ github.event.inputs.mode }}
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHANNEL: ${{ secrets.CHANNEL }}
+      ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+      DISABLE_SOURCES: ${{ vars.DISABLE_SOURCES }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore state
+        if: github.event.inputs.mode != 'check'
+        uses: actions/cache/restore@v4
+        with:
+          path: state.db
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+      - name: Run bot
+        run: |
+          if [ "$MODE" = "check" ]; then python bot.py --check; else python bot.py; fi
+      - name: Save state
+        if: always() && github.event.inputs.mode != 'check' && hashFiles('state.db') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.db
+          key: state-${{ github.run_id }}

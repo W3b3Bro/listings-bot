@@ -1,0 +1,4 @@
+env.sh
+state.db
+bot.log
+__pycache__/
