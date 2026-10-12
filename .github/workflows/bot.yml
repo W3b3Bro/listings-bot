@@ -21,7 +21,7 @@ permissions:
 jobs:
   bot:
     if: github.event_name == 'workflow_dispatch' || vars.LIVE == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
       MODE: ${{ github.event.inputs.mode }}
