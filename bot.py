@@ -5,6 +5,7 @@ Modes:
   python bot.py --check      test sources, price feeds, start-time parsing, bot token
   python bot.py --dry-run    print posts instead of sending
   python bot.py --chat-id    show chat ids that messaged the bot (for ADMIN_CHAT_ID)
+  python bot.py --preview    DM sample posts to ADMIN_CHAT_ID only (never the channel)
   python bot.py --loop       run forever, polling every 5 min (servers like Railway)
   python bot.py              poll once and post new items (run from cron)
 
@@ -70,11 +71,18 @@ def market(title):
     return ""
 
 
+DELIST_RX = re.compile(r"(?i:delist|remove)\s+((?:[A-Z0-9]{2,12}(?:\s*,\s*|\s+and\s+|\s*&\s*))*[A-Z0-9]{2,12})\b")
+
+
 def tickers(title):
     found = re.findall(r"\(([A-Z0-9]{2,12})\)", title)
     found += re.findall(r"\b([A-Z0-9]{2,12})/USDT\b", title)
     found += re.findall(r"\b([A-Z0-9]{2,12})USDT\b", title)
-    return [t for t in dict.fromkeys(found) if t not in NOT_TICKERS][:4]
+    if not found:
+        m = DELIST_RX.search(title)  # "Will Delist ABC, DEF on ..." / "to delist A, B and C ..."
+        if m:
+            found = re.findall(r"[A-Z0-9]{2,12}", m.group(1))
+    return [t for t in dict.fromkeys(found) if t not in NOT_TICKERS][:6]
 
 
 def impact(i):
@@ -163,16 +171,18 @@ def active_sources():
 MONTHS = {m: n for n, m in enumerate(
     ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
 RANGE = r"(?:\s*[-\u2013]\s*\d{1,2}:\d{2})?"  # optional '- 10:00' range end
+AMPM = r"(?:\s?(?P<ap>[AaPp][Mm]))?"
+TZ_RX = r"\s*\(?\s*(?P<z>UTC|KST)"
 TIME_RX = [
     # 2026-09-01 11:30 (UTC)   |   2026.09.01 18:00 (KST)
-    (re.compile(r"(\d{4})[-.]\s?(\d{1,2})[-.]\s?(\d{1,2})\.?[ T]*(\d{1,2}):(\d{2})(?::\d{2})?"
-                + RANGE + r"\s*\(?\s*(UTC|KST)"), "ymd"),
-    # Jul 10, 2026 12:00 UTC   |   October 3, 2026, 08:00 - 10:00 UTC
-    (re.compile(r"\b([A-Z][a-z]{2})[a-z]* (\d{1,2}), (\d{4}),? (?:at )?(\d{1,2}):(\d{2})(?::\d{2})?"
-                + RANGE + r"\s*\(?\s*(UTC|KST)"), "mdy"),
+    re.compile(r"(?P<y>\d{4})[-.]\s?(?P<mo>\d{1,2})[-.]\s?(?P<d>\d{1,2})\.?[ T]*"
+               r"(?P<h>\d{1,2}):(?P<mi>\d{2})(?::\d{2})?" + AMPM + RANGE + TZ_RX),
+    # Jul 10, 2026 12:00 UTC  |  Oct 12, 2026, 11:00AM UTC  |  October 3, 2026, 08:00 - 10:00 UTC
+    re.compile(r"\b(?P<mon>[A-Z][a-z]{2})[a-z]* (?P<d>\d{1,2}), (?P<y>\d{4}),? (?:at )?"
+               r"(?P<h>\d{1,2}):(?P<mi>\d{2})(?::\d{2})?" + AMPM + RANGE + TZ_RX),
     # 08:00 UTC on September 30, 2026
-    (re.compile(r"(\d{1,2}):(\d{2})(?::\d{2})? ?\(?(UTC|KST)\)? on ([A-Z][a-z]{2})[a-z]* (\d{1,2}), (\d{4})"),
-     "hmfirst"),
+    re.compile(r"(?P<h>\d{1,2}):(?P<mi>\d{2})(?::\d{2})?" + AMPM + r" ?\(?(?P<z>UTC|KST)\)? on "
+               r"(?P<mon>[A-Z][a-z]{2})[a-z]* (?P<d>\d{1,2}), (?P<y>\d{4})"),
 ]
 
 
@@ -204,18 +214,17 @@ def find_start(text, ts=None, earliest=False):
     """Trading-start (or, with earliest=True, earliest effective) datetime in text, else None.
     ts = announcement time; dates outside [ts-1 day, ts+45 days] are ignored."""
     cands = []
-    for rx, kind in TIME_RX:
+    for rx in TIME_RX:
         for m in rx.finditer(text):
-            g = m.groups()
+            g = m.groupdict()
             try:
-                if kind == "ymd":
-                    y, mo, d, hh, mm, z = int(g[0]), int(g[1]), int(g[2]), int(g[3]), int(g[4]), g[5]
-                elif kind == "mdy":
-                    y, mo, d, hh, mm, z = int(g[2]), MONTHS[g[0]], int(g[1]), int(g[3]), int(g[4]), g[5]
-                else:
-                    y, mo, d, hh, mm, z = int(g[5]), MONTHS[g[3]], int(g[4]), int(g[0]), int(g[1]), g[2]
+                y, d = int(g["y"]), int(g["d"])
+                mo = MONTHS[g["mon"]] if g.get("mon") else int(g["mo"])
+                hh, mm = int(g["h"]), int(g["mi"])
+                if g.get("ap"):
+                    hh = hh % 12 + (12 if g["ap"].lower() == "pm" else 0)
                 dt = datetime(y, mo, d, hh, mm,
-                              tzinfo=timezone(timedelta(hours=9)) if z == "KST" else UTC)
+                              tzinfo=timezone(timedelta(hours=9)) if g["z"] == "KST" else UTC)
             except (ValueError, KeyError):
                 continue
             if ts and not (ts - 86400 <= dt.timestamp() <= ts + 45 * 86400):
@@ -319,9 +328,11 @@ def kv_set(c, k, v):
 
 # ---------- telegram ----------
 
-def send(chat, text, reply_to=None):
+def send(chat, text, reply_to=None, button=None):
     token = os.environ["BOT_TOKEN"]
     body = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if button:
+        body["reply_markup"] = {"inline_keyboard": [[{"text": "\U0001F517 Announcement", "url": button}]]}
     if reply_to:
         body["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
     for _ in range(3):
@@ -334,33 +345,68 @@ def send(chat, text, reply_to=None):
     raise RuntimeError("Telegram rate limit not clearing")
 
 
+def fmt_time(dt):
+    u, l = dt.astimezone(UTC), dt.astimezone(TZ)
+    loc = l.strftime("%H:%M") if l.date() == u.date() else l.strftime("%d %b %H:%M")
+    return u.strftime("%d %b") + " \u00b7 " + u.strftime("%H:%M") + " UTC (" + loc + " UTC+3)"
+
+
+def clean_title(t):
+    t = re.sub(r"^New listing:\s*", "", t.strip(), flags=re.I)
+    t = re.sub(r"^(Binance|OKX|Bybit|Upbit)\s+", "", t)
+    t = re.sub(r"\s*[-\u2013]?\s*\(?\d{4}-\d{2}-\d{2}\)?\s*$", "", t)
+    t = re.sub(r"\s+(on|at)$", "", t)
+    return t if len(t) <= 110 else t[:107].rstrip() + "..."
+
+
+def meta_line(title):
+    t = title.lower()
+    bits = []
+    m = market(title)
+    if m:
+        bits.append({"perp": "Perpetual", "spot": "Spot"}[m])
+    if "seed tag" in t:
+        bits.append("Seed Tag")
+    if "krw" in t:
+        bits.append("KRW market")
+    return " \u00b7 ".join(bits)
+
+
+UP, DOWN = "\U0001F680", "\U0001F53B"
+KIND_STYLE = {"LISTING": ("\U0001F7E2", "NEW LISTING"), "DELISTING": ("\U0001F534", "DELISTING"),
+              "MONITORING": ("\U0001F7E1", "MONITORING TAG")}
+
+
 def fmt(i, start=None, perps="", take=""):
     kind = classify(i["title"])
-    head = f"{kind} | {exname(i['ex'])}" + (" | HIGH IMPACT" if impact(i) else "")
-    lines = [f"<b>{head}</b>", html.escape(i["title"])]
-    meta = []
+    icon, label = KIND_STYLE[kind]
     tk = tickers(i["title"])
+    lines = [f"{icon} <b>{label}</b> \u00b7 {exname(i['ex'])}"]
+    if impact(i):
+        lines.append("\U0001F525 <i>High impact</i>")
     if tk:
-        meta.append("Tokens: " + ", ".join(tk))
-    if market(i["title"]):
-        meta.append("Market: " + market(i["title"]))
+        lines.append(("\U0001F48E" if kind == "LISTING" else "\U0001FA99") + " <b>"
+                     + " \u00b7 ".join("$" + t for t in tk) + "</b>")
+    else:
+        lines.append("\U0001F4CC " + html.escape(clean_title(i["title"])))
+    meta = meta_line(i["title"])
     if meta:
-        lines.append(" | ".join(meta))
+        lines.append("\U0001F4CA " + meta)
     if start:
-        label = "Trading starts" if kind == "LISTING" else "Effective"
-        lines.append(f"{label}: {start.astimezone(TZ):%d %b %H:%M} UTC+3")
+        word = "Starts" if kind == "LISTING" else "Effective"
+        lines.append(f"\u23F0 {word} <b>{html.escape(fmt_time(start))}</b>")
     if perps:
-        lines.append(perps)
-    lines.append(f"Announced: {datetime.fromtimestamp(i['ts'], TZ):%d %b %H:%M} UTC+3")
-    lines.append(f'<a href="{html.escape(i["url"])}">Source</a>')
+        lines.append("\U0001F4C8 " + html.escape(perps))
     if take:
-        lines += ["", f"<b>Take:</b> {html.escape(take)}"]
+        lines += ["", f"\U0001F4AC <b>Take:</b> {html.escape(take)}"]
+    tags = ["#" + exname(i["ex"]).replace(" ", "")] + ["#" + t for t in tk]
+    lines += ["", " ".join(tags)]
     return "\n".join(lines)
 
 
 def enrich(i, mk):
     """(start datetime or None, perps line) for one announcement."""
-    start = find_start(i.get("text", "") + " " + fetch_text(i), ts=i["ts"],
+    start = find_start(i["title"] + " | " + i.get("text", "") + " " + fetch_text(i), ts=i["ts"],
                        earliest=classify(i["title"]) != "LISTING")
     perps = ""
     tk = tickers(i["title"])
@@ -415,8 +461,9 @@ def followups(c, mk, channel, dry, failed):
             continue
         chg = (p1 / p0 - 1) * 100
         if abs(chg) >= FOLLOW_MIN_MOVE:
-            text = (f"<b>{tok} {chg:+.1f}%</b> in 30 min after alert ({exname(ex)})\n"
-                    f"{fp(p0)} -> {fp(p1)}")
+            icon = "\U0001F680" if chg >= 0 else "\U0001F53B"
+            text = (f"{icon} <b>{tok} {chg:+.1f}%</b> in 30 min after alert ({exname(ex)})\n"
+                    f"{fp(p0)} \u2192 {fp(p1)}")
             if dry:
                 print(text, "\n---")
                 continue
@@ -454,7 +501,7 @@ def digest_text():
     if not rows:
         return ""
     rows.sort()
-    out = ["<b>UNLOCKS | next 7 days</b>", "<pre>Date    Token     %Sup   USD"]
+    out = ["\U0001F4C5 <b>UNLOCKS</b> \u00b7 next 7 days", "<pre>Date    Token     %Sup   USD"]
     out += [f"{d:%d %b}  {t:<8}{p:>5.1f}%  ${u:,.0f}M" for d, t, p, u in rows]
     out.append("</pre>")
     return "\n".join(out)
@@ -466,14 +513,15 @@ def recap_text(c):
     cnt = dict(c.execute("SELECT kind, COUNT(*) FROM posts WHERE ts>=? GROUP BY kind", (mid,)))
     if not cnt:
         return ""
-    lines = [f"<b>RECAP | {now:%d %b}</b>",
-             f"Listings {cnt.get('LISTING', 0)} | Delistings {cnt.get('DELISTING', 0)} "
-             f"| Monitoring {cnt.get('MONITORING', 0)}"]
+    lines = [f"\U0001F4CA <b>RECAP</b> \u00b7 {now:%d %b}",
+             f"\U0001F7E2 Listings {cnt.get('LISTING', 0)} \u00b7 \U0001F534 Delistings {cnt.get('DELISTING', 0)} "
+             f"\u00b7 \U0001F7E1 Monitoring {cnt.get('MONITORING', 0)}"]
     moves = c.execute("SELECT token, ex, chg FROM track WHERE chg IS NOT NULL AND due>=? "
                       "ORDER BY ABS(chg) DESC LIMIT 3", (mid,)).fetchall()
     if moves:
-        lines += ["", "<b>Biggest 30 min moves</b>"]
-        lines += [f"{t} {chg:+.1f}% ({exname(ex)})" for t, ex, chg in moves]
+        lines += ["", "\U0001F525 <b>Biggest 30 min moves</b>"]
+        lines += [f"{UP if chg >= 0 else DOWN} {t} {chg:+.1f}% ({exname(ex)})"
+                  for t, ex, chg in moves]
     return "\n".join(lines)
 
 
@@ -511,7 +559,7 @@ def check():
             print(f"  --    {name:<15} no matching item")
             continue
         i = cand[0]
-        start = find_start(i.get("text", "") + " " + fetch_text(i), ts=i["ts"],
+        start = find_start(i["title"] + " | " + i.get("text", "") + " " + fetch_text(i), ts=i["ts"],
                            earliest=classify(i["title"]) != "LISTING")
         shown = f"{start.astimezone(TZ):%d %b %H:%M} UTC+3" if start else "not found"
         print(f"  {'OK  ' if start else 'none'}  {name:<15} {shown} | {i['title'][:40]}")
@@ -535,6 +583,34 @@ def chat_ids():
         if ch.get("id"):
             seen[ch["id"]] = ch.get("username") or ch.get("first_name") or ch.get("title")
     print(seen or "No messages found. Send /start to the bot, then rerun.")
+
+
+def preview():
+    admin = os.environ.get("ADMIN_CHAT_ID")
+    if not (os.environ.get("BOT_TOKEN") and admin):
+        sys.exit("Set BOT_TOKEN and ADMIN_CHAT_ID. Previews go to your DM only, never the channel.")
+    now = time.time()
+    t0 = datetime(2026, 10, 12, 10, 0, tzinfo=UTC)
+    samples = [
+        (item("binance", "p1", "Binance Will List Foo (FOO) with Seed Tag Applied",
+              "https://www.binance.com/en/support/announcement/list/48", now), t0,
+         "Perps (funding): FOO: Binance +0.010%, Bybit -0.020%", "Seed tag = high volatility."),
+        (item("bybit", "p2", "New listing: Listing of PBRUSDT on Bybit TradFi Perpetual on Oct 12, 2026, 11:00AM UTC",
+              "https://announcements.bybit.com/en/", now), t0.replace(hour=11), "", ""),
+        (item("binance", "p3", "Binance Futures Will Launch Multiple TradFi USD\u24c8-Margined Perpetual Contracts (2026-10-12)",
+              "https://www.binance.com/en/support/announcement/list/48", now), t0.replace(hour=9), "", ""),
+        (item("upbit", "p4", "\uce74\uc774\uc544(KAIA) \uc2e0\uaddc \uac70\ub798\uc9c0\uc6d0 \uc548\ub0b4 (KRW, BTC, USDT \ub9c8\ucf13)",
+              "https://upbit.com/service_center/notice", now), t0.replace(hour=3), "", ""),
+        (item("okx", "p5", "OKX to delist DORA, ICX, STORJ, ZEUS and ELF spot trading pairs",
+              "https://www.okx.com/help/section/announcements-delistings", now), t0 + timedelta(days=18), "", ""),
+    ]
+    send(admin, "\U0001F440 <b>Preview</b>: sample posts below. Nothing was sent to the channel.")
+    for it, st, perps, take in samples:
+        send(admin, fmt(it, st, perps, take), button=it["url"])
+        time.sleep(1)
+    send(admin, "\U0001F680 <b>FOO +25.0%</b> in 30 min after alert (Binance)\n1 \u2192 1.25")
+    send(admin, "\U0001F4C5 <b>UNLOCKS</b> \u00b7 next 7 days\n<pre>Date    Token     %Sup   USD\n"
+                "14 Oct  ARB        2.1%  $45M</pre>")
 
 
 def run(dry):
@@ -568,10 +644,10 @@ def run(dry):
         start, perps = enrich(i, mk)
         text = fmt(i, start, perps, take if n == 0 else "")
         if dry:
-            print(text, "\n---")
+            print(text, "\n[button] " + i["url"], "\n---")
             continue
         try:
-            mid = send(channel, text)
+            mid = send(channel, text, button=i["url"])
         except Exception as e:
             failed.append(f"telegram: {type(e).__name__}")
             break
@@ -634,6 +710,7 @@ if __name__ == "__main__":
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--chat-id", action="store_true")
     ap.add_argument("--loop", action="store_true")
+    ap.add_argument("--preview", action="store_true")
     a = ap.parse_args()
     if a.loop:
         loop()
@@ -641,5 +718,7 @@ if __name__ == "__main__":
         check()
     elif a.chat_id:
         chat_ids()
+    elif a.preview:
+        preview()
     else:
         run(a.dry_run)
